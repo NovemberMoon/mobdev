@@ -13,6 +13,8 @@ import io.github.mobdev.network.MessageData
 import io.github.mobdev.network.MessageDto
 import io.github.mobdev.network.NetworkClient
 import io.github.mobdev.network.TextData
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
@@ -26,7 +28,7 @@ val Context.dataStore by preferencesDataStore(name = "user_session")
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val repository = ChatRepository()
+    private val repository = ChatRepository(application)
     private val dataStore = application.dataStore
 
     private val tokenKey = stringPreferencesKey("auth_token")
@@ -35,8 +37,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _channels = MutableStateFlow<List<String>>(emptyList())
     val channels = _channels.asStateFlow()
 
+    private var channelsJob: Job? = null
+
     private val _messages = MutableStateFlow<List<MessageDto>>(emptyList())
     val messages = _messages.asStateFlow()
+
+    private var messagesJob: Job? = null
+    private var pollingJob: Job? = null
+    private var channelsPollingJob: Job? = null
 
     private val _requireAuth = MutableStateFlow<Boolean?>(null)
     val requireAuth = _requireAuth.asStateFlow()
@@ -75,15 +83,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         viewModelScope.launch {
-            val prefs = dataStore.data.first()
-            val savedToken = prefs[tokenKey]
-            val savedUser = prefs[userKey]
+            try {
+                val prefs = dataStore.data.first()
+                val savedToken = prefs[tokenKey]
+                val savedUser = prefs[userKey]
 
-            if (!savedToken.isNullOrBlank() && !savedUser.isNullOrBlank()) {
-                NetworkClient.currentToken = savedToken
-                currentUser = savedUser
-                _requireAuth.value = false
-            } else {
+                if (!savedToken.isNullOrBlank() && !savedUser.isNullOrBlank()) {
+                    NetworkClient.currentToken = savedToken
+                    currentUser = savedUser
+                    _requireAuth.value = false
+                } else {
+                    _requireAuth.value = true
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
                 _requireAuth.value = true
             }
         }
@@ -124,14 +137,28 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun loadChannels() {
-        viewModelScope.launch {
-            try {
-                _channels.value = repository.getChannels()
-            } catch (e: HttpException) {
-                e.printStackTrace()
-                if (e.code() == 401) logout()
-            } catch (e: Exception) {
-                e.printStackTrace()
+        channelsJob?.cancel()
+        channelsJob = viewModelScope.launch {
+            repository.getChannelsFlow().collect { localChannels ->
+                _channels.value = localChannels
+            }
+        }
+
+        channelsPollingJob?.cancel()
+        channelsPollingJob = viewModelScope.launch {
+            while (true) {
+                try {
+                    repository.fetchChannelsFromNetwork()
+                    repository.syncPendingMessages()
+                } catch (e: HttpException) {
+                    if (e.code() == 401) {
+                        logout()
+                        break
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+                delay(10000)
             }
         }
     }
@@ -139,34 +166,49 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun loadInitialMessages(channel: String) {
         if (_currentChannel.value == channel && _messages.value.isNotEmpty()) return
 
-        if (!channels.value.contains(channel)) {
-            _channels.value = listOf(channel) + _channels.value
+        viewModelScope.launch {
+            repository.addChannelLocal(channel)
         }
 
         _currentChannel.value = channel
-        _messages.value = emptyList()
         _inputText.value = ""
         isLastPage = false
-        fetchMessages(null)
+
+        messagesJob?.cancel()
+        pollingJob?.cancel()
+
+        messagesJob = viewModelScope.launch {
+            repository.getMessagesFlow(channel).collect { localMessages ->
+                _messages.value = localMessages
+            }
+        }
+
+        pollingJob = viewModelScope.launch {
+            while (true) {
+                try {
+                    repository.syncPendingMessages()
+                    repository.fetchMessagesFromNetwork(channel, isPagination = false)
+                } catch (e: HttpException) {
+                    if (e.code() == 401) {
+                        logout()
+                        break
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+                delay(5000)
+            }
+        }
     }
 
     fun loadMoreMessages() {
         if (isLoading || isLastPage || _currentChannel.value == null) return
-        val lastId = _messages.value.lastOrNull()?.id
-        fetchMessages(lastId)
-    }
-
-    private fun fetchMessages(lastId: String?) {
         val channel = _currentChannel.value ?: return
+
         isLoading = true
         viewModelScope.launch {
             try {
-                val newMessages = repository.getMessages(channel, lastId)
-                if (newMessages.isEmpty()) isLastPage = true
-                else {
-                    val combined = (_messages.value + newMessages).distinctBy { it.id }
-                    _messages.value = combined
-                }
+                repository.fetchMessagesFromNetwork(channel, isPagination = true)
             } catch (e: HttpException) {
                 e.printStackTrace()
                 if (e.code() == 401) logout()
@@ -200,6 +242,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun sendMessage(text: String) {
         val channel = _currentChannel.value ?: return
+        _inputText.value = ""
+
         viewModelScope.launch {
             try {
                 val msg = MessageDto(
@@ -207,17 +251,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     from = currentUser,
                     to = channel,
                     data = MessageData(textObj = TextData(text), imageObj = null),
-                    time = null
+                    time = System.currentTimeMillis()
                 )
-                repository.sendMessage(msg)
-
-                _inputText.value = ""
-                _messages.value = emptyList()
-                isLastPage = false
-                fetchMessages(null)
-            } catch (e: HttpException) {
-                e.printStackTrace()
-                if (e.code() == 401) logout()
+                repository.sendMessage(msg, channel)
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -232,8 +268,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val contentResolver = getApplication<Application>().contentResolver
                 val mimeType = contentResolver.getType(uri) ?: "image/jpeg"
 
-                val bytes = contentResolver.openInputStream(uri)?.readBytes()
-                    ?: return@launch
+                val bytes = contentResolver.openInputStream(uri)?.readBytes() ?: return@launch
                 val requestFile = bytes.toRequestBody(mimeType.toMediaTypeOrNull())
                 val bodyPart =
                     MultipartBody.Part.createFormData("picture", "upload.jpg", requestFile)
@@ -241,11 +276,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val jsonString = """{"from":"$currentUser","to":"$channel"}"""
                 val msgPart = jsonString.toRequestBody("application/json".toMediaTypeOrNull())
 
-                repository.sendImage(msgPart, bodyPart)
-
-                _messages.value = emptyList()
-                isLastPage = false
-                fetchMessages(null)
+                repository.sendImage(msgPart, bodyPart, channel)
             } catch (e: Exception) {
                 e.printStackTrace()
             } finally {
@@ -255,6 +286,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun clearChannel() {
+        messagesJob?.cancel()
+        pollingJob?.cancel()
         _currentChannel.value = null
         _inputText.value = ""
     }
@@ -269,9 +302,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             NetworkClient.currentToken = null
             dataStore.edit { prefs -> prefs.clear() }
             _requireAuth.value = true
-            _currentChannel.value = null
-            _messages.value = emptyList()
-            _inputText.value = ""
+            clearChannel()
         }
     }
 }
