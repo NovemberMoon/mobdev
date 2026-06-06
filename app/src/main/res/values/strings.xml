@@ -1,3 +1,21 @@
 <resources>
-    <string name="app_name">mobdev</string>
+    <string name="app_name">Чат</string>
+    <string name="login_title">Вход в чат</string>
+    <string name="login_hint">Логин</string>
+    <string name="password_hint">Пароль</string>
+    <string name="btn_login">Войти</string>
+    <string name="error_title">Ошибка</string>
+    <string name="invalid_credentials">Неверный логин / пароль</string>
+    <string name="error_network">Ошибка сети</string>
+    <string name="ok">ОК</string>
+    <string name="chat_list_title">Чаты</string>
+    <string name="btn_logout">Выход</string>
+    <string name="msg_placeholder">Введите сообщение...</string>
+    <string name="btn_send">Отправить</string>
+    <string name="btn_back">Назад</string>
+    <string name="btn_close">Закрыть</string>
+    <string name="select_chat">Выберите чат</string>
+    <string name="new_chat">Новый чат</string>
+    <string name="chat_name_hint">Название (без @channel)</string>
+    <string name="create">Создать</string>
 </resources>
